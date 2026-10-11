@@ -1,7 +1,7 @@
 #define _DEFAULT_SOURCE
 
 /*
- * Programming Assignment 02: ls v1.2.0 — column display, down-then-across
+ * Programming Assignment 02: ls v1.3.0 — horizontal display (-x)
  *
  * Extends v1.1.0 with the -l option:
  *   -lstat() (not stat()) so symlinks are listed as links, not followed
@@ -9,10 +9,14 @@
  *   max column widths, then print aligned
  * v1.2.0: default (non -l) path prints names in columns, top-to-bottom
  *   then left-to-right, sized from the terminal width via ioctl().
+ * v1.3.0: -x prints names in horizontal columns (left-to-right across each
+ *   row) instead; -l still selects the long listing. When both -l and -x
+ *   are given, the LAST flag wins.
  *
  * Usage:
  *       $ ./ls
  *       $ ./ls -l
+ *       $ ./ls -x
  *       $ ./ls -l /home /etc
  */
 #include <stdio.h>
@@ -28,8 +32,24 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 
-void do_ls(const char *dir);
+/* Display modes: the last of -l / -x on the command line wins. */
+enum display_mode { MODE_DEFAULT, MODE_LONG, MODE_HORIZONTAL };
+
+void do_ls(const char *dir, enum display_mode mode);
 void do_ls_long(const char *dir);
+
+/*
+ * term_width: terminal width via ioctl(STDOUT_FILENO, TIOCGWINSZ).
+ * Returns 80 when stdout is not a terminal or the call fails.
+ */
+static int term_width(void)
+{
+    int width = 80;
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col != 0)
+        width = ws.ws_col;
+    return width;
+}
 
 /* One collected entry for the two-pass long listing */
 struct file_entry {
@@ -98,49 +118,102 @@ static void time_string(time_t mtime, char *out, size_t n)
 
 int main(int argc, char *argv[])
 {
-    int long_flag = 0;
+    enum display_mode mode = MODE_DEFAULT;
     int opt;
 
-    while ((opt = getopt(argc, argv, "l")) != -1) {
-        if (opt == 'l') {
-            long_flag = 1;
-        } else {
-            fprintf(stderr, "Usage: %s [-l] [dir ...]\n", argv[0]);
+    while ((opt = getopt(argc, argv, "lx")) != -1) {
+        if (opt == 'l')
+            mode = MODE_LONG;        /* last flag wins */
+        else if (opt == 'x')
+            mode = MODE_HORIZONTAL;  /* last flag wins */
+        else {
+            fprintf(stderr, "Usage: %s [-l] [-x] [dir ...]\n", argv[0]);
             return 2;
         }
     }
 
     if (optind == argc) {
-        if (long_flag)
+        if (mode == MODE_LONG)
             do_ls_long(".");
         else
-            do_ls(".");
+            do_ls(".", mode);
     } else {
         for (int i = optind; i < argc; i++) {
             printf("Directory listing of %s : \n", argv[i]);
-            if (long_flag)
+            if (mode == MODE_LONG)
                 do_ls_long(argv[i]);
             else
-                do_ls(argv[i]);
+                do_ls(argv[i], mode);
             puts("");
         }
     }
     return 0;
 }
 
-/* v1.2.0: column display, down-then-across.
- *
- * Names are first read into a dynamic array (strdup + realloc), so we know
- * the longest name before printing anything. Terminal width comes from
- * ioctl(STDOUT_FILENO, TIOCGWINSZ) — 80 is the fallback when stdout is not
- * a terminal or the call fails. Then:
- *   col_width = longest name + 2 (padding)
- *   ncols = term_width / col_width   (at least 1)
- *   nrows = ceil(count / ncols)
- * Output is row-major: row r of column c holds entry c*nrows + r, i.e. the
- * columns fill top-to-bottom before moving right, like GNU ls.
+/*
+ * do_ls: read every visible name into a dynamic array (strdup + realloc),
+ * tracking the longest name, then dispatch to the chosen printer:
+ *   MODE_DEFAULT      -> print_columns_down()    (top-to-bottom, like GNU ls)
+ *   MODE_HORIZONTAL   -> print_columns_across()  (left-to-right, like ls -x)
  */
-void do_ls(const char *dir)
+/*
+ * print_columns_down: v1.2.0 layout — columns fill top-to-bottom first,
+ * then left-to-right. Row r of column c holds entry c*nrows + r.
+ */
+static void print_columns_down(char **names, size_t n, size_t maxlen)
+{
+    int width = term_width();
+
+    size_t col_width = maxlen + 2;
+    size_t ncols = (size_t)width / col_width;
+    if (ncols == 0)
+        ncols = 1;
+    size_t nrows = (n + ncols - 1) / ncols;
+
+    for (size_t r = 0; r < nrows; r++) {
+        for (size_t c = 0; c < ncols; c++) {
+            size_t idx = c * nrows + r;
+            if (idx >= n)
+                continue;
+            size_t last_idx = (ncols - 1) * nrows + r;
+            int is_last_col = (c == ncols - 1) || (last_idx >= n);
+            if (is_last_col)
+                printf("%s", names[idx]);
+            else
+                printf("%-*s", (int)col_width, names[idx]);
+        }
+        putchar('\n');
+    }
+}
+
+/*
+ * print_columns_across: v1.3.0 layout — entries flow left-to-right along
+ * each row (like GNU ls -x). Single pass: keep track of the current cursor
+ * position; when the next padded item would overrun the terminal width,
+ * start a new line. The line-start item never wraps, even if it alone is
+ * wider than the terminal. The final name gets no trailing padding.
+ */
+static void print_columns_across(char **names, size_t n, size_t maxlen)
+{
+    int width = term_width();
+    size_t col_width = maxlen + 2;
+    size_t pos = 0;   /* characters consumed on the current line */
+
+    for (size_t i = 0; i < n; i++) {
+        if (pos > 0 && pos + col_width > (size_t)width) {
+            putchar('\n');
+            pos = 0;
+        }
+        if (i == n - 1)
+            printf("%s", names[i]);      /* last item: no padding */
+        else
+            printf("%-*s", (int)col_width, names[i]);
+        pos += col_width;
+    }
+    putchar('\n');
+}
+
+void do_ls(const char *dir, enum display_mode mode)
 {
     DIR *dp = opendir(dir);
     if (dp == NULL)
@@ -191,31 +264,10 @@ void do_ls(const char *dir)
         return;
     }
 
-    int term_width = 80;
-    struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col != 0)
-        term_width = ws.ws_col;
-
-    size_t col_width = maxlen + 2;
-    size_t ncols = (size_t)term_width / col_width;
-    if (ncols == 0)
-        ncols = 1;
-    size_t nrows = (n + ncols - 1) / ncols;
-
-    for (size_t r = 0; r < nrows; r++) {
-        for (size_t c = 0; c < ncols; c++) {
-            size_t idx = c * nrows + r;
-            if (idx >= n)
-                continue;
-            size_t last_idx = (ncols - 1) * nrows + r;
-            int is_last_col = (c == ncols - 1) || (last_idx >= n);
-            if (is_last_col)
-                printf("%s", names[idx]);
-            else
-                printf("%-*s", (int)col_width, names[idx]);
-        }
-        putchar('\n');
-    }
+    if (mode == MODE_HORIZONTAL)
+        print_columns_across(names, n, maxlen);
+    else
+        print_columns_down(names, n, maxlen);
 
     for (size_t i = 0; i < n; i++)
         free(names[i]);

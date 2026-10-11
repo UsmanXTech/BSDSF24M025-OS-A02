@@ -88,3 +88,48 @@ a narrower real terminal will wrap mid-line and shatter the column alignment,
 a wider one wastes space; also, redirecting to a pipe means the "screen width"
 is meaningless, which is why GNU `ls` switches to one-per-line when stdout is
 not a tty (a refinement we haven't added yet).
+
+## v1.3.0 — Horizontal display (-x)
+
+The `-x` option prints names in horizontal columns: entries flow left-to-right
+along each row instead of top-to-bottom down each column. `getopt()` now takes
+`"lx"`; the mode is stored in an `enum display_mode`
+(`MODE_DEFAULT` / `MODE_LONG` / `MODE_HORIZONTAL`) and assigned on each flag,
+so the **last** flag wins (`-lx` → horizontal, `-xl` → long). `do_ls()`
+collects names exactly as before and then dispatches to one of two printers:
+`print_columns_down()` (v1.2.0 layout) or the new `print_columns_across()`.
+The horizontal printer is a single pass: it tracks `pos`, the number of
+characters used on the current line, and starts a new line when
+`pos + col_width` would exceed the terminal width. The first item of a line
+never triggers a wrap (it prints even if it is wider than the terminal), and
+the final name gets no trailing padding.
+
+### Q&A
+
+**Q1. Compare vertical (down-then-across) and horizontal printing complexity —
+which needs more pre-calculation and why?**
+
+The vertical layout needs more pre-calculation. To print even the first row
+of a vertical layout you must know which item sits in *every* column of that
+row (`idx = c*nrows + r`), so you have to read all names first, find the
+longest one, and compute `ncols` and `nrows` before printing a single
+character — the index mapping is two-dimensional. The horizontal layout needs
+no such grid: items are printed in order and a line break is emitted whenever
+the running position `pos + col_width` would exceed the terminal width, so
+the decision for each item depends only on the cursor's current position, not
+on the whole set. The tradeoff: vertical gives you the classic column look
+but demands the full grid up front; horizontal is a simpler streaming pass.
+
+**Q2. How are display modes managed — how does the program choose the print
+function?**
+
+The mode is held in a single variable of type `enum display_mode`, initialized
+to `MODE_DEFAULT`. While `getopt()` parses the flags, `-l` assigns
+`MODE_LONG` and `-x` assigns `MODE_HORIZONTAL` — a plain assignment, so when
+both flags appear the last one processed wins. `main()` uses the mode for the
+top-level choice (`do_ls_long()` vs `do_ls()`), and `do_ls()` dispatches to
+the column printer with one `if`: `MODE_HORIZONTAL` →
+`print_columns_across()`, anything else → `print_columns_down()`. The reading
+logic (opendir/readdir/strdup) is shared by both layouts; only the printing
+differs, so adding a mode means adding one enum value, one flag letter, and
+one printer function.
