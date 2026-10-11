@@ -178,3 +178,47 @@ name array, elements are `char *`, so the parameters are really
 `return strcmp(*sa, *sb);`. For the long listing, elements are
 `struct file_entry`, so we cast to `const struct file_entry *` and compare
 `ea->name` vs `eb->name`.
+
+## v1.5.0 — Colorized output
+
+Names are wrapped in ANSI escape sequences when stdout is a terminal:
+directories blue (`\033[0;34m`), executables green (`\033[0;32m`), archives
+(`.tar`/`.gz`/`.zip`) red (`\033[0;31m`), symlinks pink (`\033[0;35m`),
+special files (char/block/fifo/socket) reverse video (`\033[7m`), and every
+colored name ends with a reset (`\033[0m`). The entry's type and
+executability come from `lstat()` mode bits (not the name), with precedence:
+symlink > directory > archive > executable > special > plain.
+`main()` sets a global flag from `isatty(STDOUT_FILENO)`, so piped/redirected
+output stays plain text with zero escape bytes. The column printers resolve
+each name to a full path for `lstat()` and apply padding to the *visible*
+name only, keeping columns aligned despite the zero-width codes; the long
+listing reuses the already-stated entry array.
+
+### Q&A
+
+**Q1. How do ANSI escape sequences work? Give the green sequence.**
+
+A terminal interprets certain byte sequences as commands instead of printable
+text. A sequence starts with the Escape character (ASCII 27, `\033` in C),
+followed by `[`, then parameter bytes, and ends with a letter that names the
+command. `m` (Select Graphic Rendition) changes text rendering: `0` = normal
+attributes, `1` = bold, `30–37` = foreground colors, `7` = reverse video.
+So `\033[0;32m` means: escape, start sequence, parameters "0" (normal) and
+"32" (green foreground), command `m` — everything printed after it appears
+green until another `m` sequence changes it. That's why every colored name is
+followed by `\033[0m` (parameters "0", reset all attributes): without the
+reset, the color would bleed into the next filename. Sequences are *zero
+width* — they move no cursor — which is why column padding must be computed
+from the name length alone, with codes wrapped around it.
+
+**Q2. Which `st_mode` bits determine executability?**
+
+The three execute bits in `st_mode`: `S_IXUSR` (owner execute), `S_IXGRP`
+(group execute), and `S_IXOTH` (other execute) — bitmask `0111` octal in the
+permission field. A file counts as executable for coloring if *any* of the
+three is set: `st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)`. For a regular file
+this usually means it can be run as a program or script; for a directory the
+same bits mean "search permission" (you can enter it), which is why
+directories are colored blue by the file *type* check (`S_ISDIR`) instead of
+green. Note the check is deliberately OR, not AND — an `rwxr--r--` script
+with only the owner bit set is still green, just like GNU `ls`.

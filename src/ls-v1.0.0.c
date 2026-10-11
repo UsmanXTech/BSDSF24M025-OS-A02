@@ -14,6 +14,9 @@
  *   are given, the LAST flag wins.
  * v1.4.0: all listings are sorted alphabetically with qsort() before any
  *   display (default, -x, and -l).
+ * v1.5.0: colorized output — directories blue, executables green, archives
+ *   red, symlinks pink, special files reverse video; only when stdout is
+ *   a terminal (isatty()), with a reset code after every colored name.
  *
  * Usage:
  *       $ ./ls
@@ -33,6 +36,22 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+
+/*
+ * v1.5.0 — ANSI color codes. Color is only emitted when stdout is a
+ * terminal; see g_color_enabled (set in main() from isatty()). The reset
+ * code is printed after every colored name so colors never bleed into
+ * the next field.
+ */
+#define COL_RESET   "\033[0m"
+#define COL_DIR     "\033[0;34m"
+#define COL_EXEC    "\033[0;32m"
+#define COL_ARCHIVE "\033[0;31m"
+#define COL_SYMLINK "\033[0;35m"
+#define COL_SPECIAL "\033[7m"
+
+/* 1 when stdout is a tty and colors may be emitted, else 0. */
+static int g_color_enabled = 0;
 
 /* Display modes: the last of -l / -x on the command line wins. */
 enum display_mode { MODE_DEFAULT, MODE_LONG, MODE_HORIZONTAL };
@@ -80,6 +99,82 @@ static int cmp_entry(const void *a, const void *b)
     const struct file_entry *ea = a;
     const struct file_entry *eb = b;
     return strcmp(ea->name, eb->name);
+}
+
+/*
+ * v1.5.0 — color helpers.
+ *
+ * has_archive_ext: true when the name ends in a known archive suffix
+ * (.tar, .gz, .zip).
+ */
+static int has_archive_ext(const char *name)
+{
+    static const char *exts[] = { ".tar", ".gz", ".zip" };
+    size_t nlen = strlen(name);
+    for (size_t i = 0; i < sizeof exts / sizeof *exts; i++) {
+        size_t elen = strlen(exts[i]);
+        if (nlen > elen && strcmp(name + nlen - elen, exts[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * color_code: pick the ANSI color for an entry from its lstat() mode and
+ * name. Precedence: symlink > directory > archive > executable > special
+ * file > plain (no color). Returns the code string, or "" when no color
+ * applies. Callers print COL_RESET after the name whenever this is
+ * non-empty.
+ */
+static const char *color_code(const struct stat *st, const char *name)
+{
+    if (S_ISLNK(st->st_mode))
+        return COL_SYMLINK;
+    if (S_ISDIR(st->st_mode))
+        return COL_DIR;
+    if (has_archive_ext(name))
+        return COL_ARCHIVE;
+    if (st->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))
+        return COL_EXEC;
+    if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode) ||
+        S_ISFIFO(st->st_mode) || S_ISSOCK(st->st_mode))
+        return COL_SPECIAL;
+    return "";
+}
+
+/*
+ * color_code_path: lstat() dir/name and return its color code. The column
+ * printers only have plain names, so they resolve the full path here to
+ * get the mode bits. Returns "" when the entry can't be stated.
+ */
+static const char *color_code_path(const char *dir, const char *name)
+{
+    char path[4096];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    if (lstat(path, &st) != 0)
+        return "";
+    return color_code(&st, name);
+}
+
+/*
+ * print_name_colored: print name wrapped in its color code and COL_RESET.
+ * When colors are disabled or the entry has no color, prints the name
+ * alone. Padding is applied to the name only (codes are zero-width), so
+ * columns stay aligned. pad = 0 means no padding.
+ */
+static void print_name_colored(const char *code, const char *name, int pad)
+{
+    if (!g_color_enabled || code[0] == '\0') {
+        if (pad > 0)
+            printf("%-*s", pad, name);
+        else
+            printf("%s", name);
+    } else if (pad > 0) {
+        printf("%s%-*s%s", code, pad, name, COL_RESET);
+    } else {
+        printf("%s%s%s", code, name, COL_RESET);
+    }
 }
 
 /*
@@ -146,6 +241,10 @@ int main(int argc, char *argv[])
     enum display_mode mode = MODE_DEFAULT;
     int opt;
 
+    /* v1.5.0: only emit colors when stdout is a real terminal — piping
+     * ls to cat/grep must produce clean, code-free text. */
+    g_color_enabled = isatty(STDOUT_FILENO);
+
     while ((opt = getopt(argc, argv, "lx")) != -1) {
         if (opt == 'l')
             mode = MODE_LONG;        /* last flag wins */
@@ -184,8 +283,11 @@ int main(int argc, char *argv[])
 /*
  * print_columns_down: v1.2.0 layout — columns fill top-to-bottom first,
  * then left-to-right. Row r of column c holds entry c*nrows + r.
+ * v1.5.0: names are printed through print_name_colored() (needs dir to
+ * lstat each entry); padding still applies to the visible name only.
  */
-static void print_columns_down(char **names, size_t n, size_t maxlen)
+static void print_columns_down(char **names, size_t n, size_t maxlen,
+                               const char *dir)
 {
     int width = term_width();
 
@@ -201,10 +303,11 @@ static void print_columns_down(char **names, size_t n, size_t maxlen)
             if (idx >= n)
                 break;   /* idx only grows with c: no more entries in this row */
             size_t next_idx = (c + 1) * nrows + r;
+            const char *code = color_code_path(dir, names[idx]);
             if (next_idx >= n)
-                printf("%s", names[idx]);   /* last entry on this line: no padding */
+                print_name_colored(code, names[idx], 0); /* last on line: no padding */
             else
-                printf("%-*s", (int)col_width, names[idx]);
+                print_name_colored(code, names[idx], (int)col_width);
         }
         putchar('\n');
     }
@@ -216,8 +319,10 @@ static void print_columns_down(char **names, size_t n, size_t maxlen)
  * position; when the next padded item would overrun the terminal width,
  * start a new line. The line-start item never wraps, even if it alone is
  * wider than the terminal. The final name gets no trailing padding.
+ * v1.5.0: colors applied the same way as print_columns_down().
  */
-static void print_columns_across(char **names, size_t n, size_t maxlen)
+static void print_columns_across(char **names, size_t n, size_t maxlen,
+                                 const char *dir)
 {
     int width = term_width();
     size_t col_width = maxlen + 2;
@@ -228,10 +333,11 @@ static void print_columns_across(char **names, size_t n, size_t maxlen)
             putchar('\n');
             pos = 0;
         }
+        const char *code = color_code_path(dir, names[i]);
         if (i == n - 1)
-            printf("%s", names[i]);      /* last item: no padding */
+            print_name_colored(code, names[i], 0);      /* last item: no padding */
         else
-            printf("%-*s", (int)col_width, names[i]);
+            print_name_colored(code, names[i], (int)col_width);
         pos += col_width;
     }
     putchar('\n');
@@ -292,9 +398,9 @@ void do_ls(const char *dir, enum display_mode mode)
     qsort(names, n, sizeof *names, cmp_name);
 
     if (mode == MODE_HORIZONTAL)
-        print_columns_across(names, n, maxlen);
+        print_columns_across(names, n, maxlen, dir);
     else
-        print_columns_down(names, n, maxlen);
+        print_columns_down(names, n, maxlen, dir);
 
     for (size_t i = 0; i < n; i++)
         free(names[i]);
@@ -384,14 +490,18 @@ void do_ls_long(const char *dir)
         char tstr[32];
         time_string(arr[i].st.st_mtime, tstr, sizeof tstr);
 
-        printf("%s %*lu %-*s %-*s %*lld %s %s",
+        printf("%s %*lu %-*s %-*s %*lld %s ",
                mstr,
                (int)w_nlink, (unsigned long)arr[i].st.st_nlink,
                (int)w_user, pw ? pw->pw_name : "?",
                (int)w_group, gr ? gr->gr_name : "?",
                (int)w_size, (long long)arr[i].st.st_size,
-               tstr,
-               arr[i].name);
+               tstr);
+
+        /* v1.5.0: colorize the name; reset before " -> target" so the
+         * target path stays uncolored. */
+        print_name_colored(color_code(&arr[i].st, arr[i].name),
+                           arr[i].name, 0);
 
         if (S_ISLNK(arr[i].st.st_mode)) {
             char path[4096], target[1024];
