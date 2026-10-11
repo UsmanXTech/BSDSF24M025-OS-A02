@@ -222,3 +222,46 @@ same bits mean "search permission" (you can enter it), which is why
 directories are colored blue by the file *type* check (`S_ISDIR`) instead of
 green. Note the check is deliberately OR, not AND — an `rwxr--r--` script
 with only the owner bit set is still green, just like GNU `ls`.
+
+## v1.6.0 — Recursive listing (-R)
+
+`main()` parses `-R` with `getopt("lxR")` into a global flag that is
+independent of the display mode, so `-R` combines freely with default,
+`-l`, and `-x`. When set, `main()` calls `do_ls_recursive(dir, mode)`
+instead of `do_ls()`/`do_ls_long()` for each operand. `do_ls_recursive()`
+does three things: (1) prints the `dir:` header, (2) lists the directory
+itself by *reusing* the existing `do_ls()`/`do_ls_long()` unchanged (this
+is what makes `-lR` and `-xR` work with no extra code), and (3) rescans
+the directory, `lstat()`s each entry, collects subdirectories into a
+dynamic array, sorts them with `qsort()` + the existing `cmp_name`, and
+recurses into each full path. Sorting the subdirectories before recursing
+keeps the output order stable, matching GNU `ls -R`.
+
+### Q&A
+
+**Q1. What is the base case that stops infinite recursion?**
+
+There is no explicit depth counter; the base case is *structural*.
+Every directory contains `.` (itself) and `..` (its parent), and the
+recursion function skips both by name before descending. Without that
+check, recursing into `.` would revisit the same directory forever, and
+recursing into `..` would climb back up and re-list the whole subtree —
+an infinite loop. Additionally, symlinks are never descended into:
+`lstat()` reports a symlink-to-directory as `S_ISLNK`, not `S_ISDIR`,
+so the descent test fails and a symlink cycle (a link pointing back up
+the tree) cannot trap the walk. Hidden entries (names starting with `.`)
+are skipped too, consistent with the listing logic.
+
+**Q2. Why must a full path be built before recursing — what breaks with a
+bare relative name?**
+
+`readdir()` returns only bare entry names (`alpha`, `a1.txt`), not paths.
+`opendir("alpha")` resolves relative to the *process's current working
+directory*, not the directory being listed — our program never calls
+`chdir()`, so a bare name only works for the top-level directory. When
+recursing into `/tmp/rtest/gamma/deep`, `opendir("deep")` would look for
+`./deep` in the CWD and fail (or worse, open the wrong directory with a
+coincidental name). Joining `dir + "/" + name` into `path` gives an
+unambiguous name for `lstat()` and the recursive `opendir()` — this is
+exactly why each `do_ls_recursive()` call builds and passes the full
+path down the tree.

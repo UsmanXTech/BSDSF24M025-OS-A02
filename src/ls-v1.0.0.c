@@ -17,12 +17,15 @@
  * v1.5.0: colorized output — directories blue, executables green, archives
  *   red, symlinks pink, special files reverse video; only when stdout is
  *   a terminal (isatty()), with a reset code after every colored name.
+ * v1.6.0: -R descends into subdirectories recursively, printing a
+ *   "dir:" header before each directory's listing; combines with -l and -x.
  *
  * Usage:
  *       $ ./ls
  *       $ ./ls -l
  *       $ ./ls -x
- *       $ ./ls -l /home /etc
+ *       $ ./ls -R
+ *       $ ./ls -lR /home /etc
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,8 +59,12 @@ static int g_color_enabled = 0;
 /* Display modes: the last of -l / -x on the command line wins. */
 enum display_mode { MODE_DEFAULT, MODE_LONG, MODE_HORIZONTAL };
 
+/* 1 when -R was given: descend into subdirectories (independent of mode). */
+static int g_recursive = 0;
+
 void do_ls(const char *dir, enum display_mode mode);
 void do_ls_long(const char *dir);
+void do_ls_recursive(const char *dir, enum display_mode mode);
 
 /*
  * term_width: terminal width via ioctl(STDOUT_FILENO, TIOCGWINSZ).
@@ -245,33 +252,119 @@ int main(int argc, char *argv[])
      * ls to cat/grep must produce clean, code-free text. */
     g_color_enabled = isatty(STDOUT_FILENO);
 
-    while ((opt = getopt(argc, argv, "lx")) != -1) {
+    while ((opt = getopt(argc, argv, "lxR")) != -1) {
         if (opt == 'l')
             mode = MODE_LONG;        /* last flag wins */
         else if (opt == 'x')
             mode = MODE_HORIZONTAL;  /* last flag wins */
+        else if (opt == 'R')
+            g_recursive = 1;         /* separate flag, combines with any mode */
         else {
-            fprintf(stderr, "Usage: %s [-l] [-x] [dir ...]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [-l] [-x] [-R] [dir ...]\n", argv[0]);
             return 2;
         }
     }
 
     if (optind == argc) {
-        if (mode == MODE_LONG)
+        if (g_recursive)
+            do_ls_recursive(".", mode);
+        else if (mode == MODE_LONG)
             do_ls_long(".");
         else
             do_ls(".", mode);
     } else {
         for (int i = optind; i < argc; i++) {
-            printf("Directory listing of %s : \n", argv[i]);
-            if (mode == MODE_LONG)
-                do_ls_long(argv[i]);
-            else
-                do_ls(argv[i], mode);
-            puts("");
+            if (g_recursive) {
+                /* the recursive function prints its own "dir:" headers */
+                if (i > optind)
+                    putchar('\n');   /* separator between operands, like GNU */
+                do_ls_recursive(argv[i], mode);
+            } else {
+                printf("Directory listing of %s : \n", argv[i]);
+                if (mode == MODE_LONG)
+                    do_ls_long(argv[i]);
+                else
+                    do_ls(argv[i], mode);
+                puts("");
+            }
         }
     }
     return 0;
+}
+
+/*
+ * do_ls_recursive: v1.6.0 — list dir with the existing logic, then descend
+ * into every subdirectory (sorted, so output order is stable).
+ *
+ *   1. Print the "dir:" header, then the listing itself — do_ls() /
+ *      do_ls_long() are reused unchanged, so -l and -x combine naturally.
+ *   2. Re-scan the directory, collect subdirectories into a dynamic
+ *      array (lstat(), NOT stat(), so a symlink pointing at a directory
+ *      is a link, not a descent — no symlink cycles), skip "." and ".."
+ *      plus hidden entries (the listings skip them too), sort, recurse.
+ */
+void do_ls_recursive(const char *dir, enum display_mode mode)
+{
+    printf("%s:\n", dir);
+    if (mode == MODE_LONG)
+        do_ls_long(dir);
+    else
+        do_ls(dir, mode);
+
+    DIR *dp = opendir(dir);
+    if (dp == NULL)
+        return;   /* do_ls/do_ls_long already reported the error */
+
+    char **subdirs = NULL;
+    size_t cap = 0, n = 0;
+
+    errno = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dp)) != NULL) {
+        /* base case: never descend into "." or "..", or we would
+         * recurse forever — they always resolve back to an ancestor. */
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0)
+            continue;
+        if (entry->d_name[0] == '.')
+            continue;   /* hidden entries are not listed, so not recursed */
+
+        char path[4096];
+        snprintf(path, sizeof path, "%s/%s", dir, entry->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0)
+            continue;
+        if (!S_ISDIR(st.st_mode))
+            continue;
+
+        if (n == cap) {
+            cap = cap ? cap * 2 : 16;
+            char **tmp = realloc(subdirs, cap * sizeof *tmp);
+            if (tmp == NULL) {
+                perror("realloc");
+                break;
+            }
+            subdirs = tmp;
+        }
+        subdirs[n] = strdup(path);
+        if (subdirs[n] == NULL) {
+            perror("strdup");
+            break;
+        }
+        n++;
+    }
+    if (errno != 0)
+        perror("readdir failed");
+    closedir(dp);
+
+    qsort(subdirs, n, sizeof *subdirs, cmp_name);
+
+    for (size_t i = 0; i < n; i++) {
+        putchar('\n');
+        do_ls_recursive(subdirs[i], mode);
+        free(subdirs[i]);
+    }
+    free(subdirs);
 }
 
 /*
