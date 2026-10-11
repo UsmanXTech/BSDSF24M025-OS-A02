@@ -1,12 +1,14 @@
 #define _DEFAULT_SOURCE
 
 /*
- * Programming Assignment 02: ls v1.1.0 — long listing (-l)
+ * Programming Assignment 02: ls v1.2.0 — column display, down-then-across
  *
- * Extends v1.0.0 with the -l option:
+ * Extends v1.1.0 with the -l option:
  *   -lstat() (not stat()) so symlinks are listed as links, not followed
  *   two-pass: collect entries into a dynamic array (realloc) measuring
  *   max column widths, then print aligned
+ * v1.2.0: default (non -l) path prints names in columns, top-to-bottom
+ *   then left-to-right, sized from the terminal width via ioctl().
  *
  * Usage:
  *       $ ./ls
@@ -24,6 +26,7 @@
 #include <grp.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 
 void do_ls(const char *dir);
 void do_ls_long(const char *dir);
@@ -125,22 +128,55 @@ int main(int argc, char *argv[])
     return 0;
 }
 
-/* v1.0.0: one name per line, dotfiles skipped */
+/* v1.2.0: column display, down-then-across.
+ *
+ * Names are first read into a dynamic array (strdup + realloc), so we know
+ * the longest name before printing anything. Terminal width comes from
+ * ioctl(STDOUT_FILENO, TIOCGWINSZ) — 80 is the fallback when stdout is not
+ * a terminal or the call fails. Then:
+ *   col_width = longest name + 2 (padding)
+ *   ncols = term_width / col_width   (at least 1)
+ *   nrows = ceil(count / ncols)
+ * Output is row-major: row r of column c holds entry c*nrows + r, i.e. the
+ * columns fill top-to-bottom before moving right, like GNU ls.
+ */
 void do_ls(const char *dir)
 {
-    struct dirent *entry;
     DIR *dp = opendir(dir);
     if (dp == NULL)
     {
         fprintf(stderr, "Cannot open directory : %s\n", dir);
         return;
     }
+
+    char **names = NULL;
+    size_t cap = 0, n = 0;
+    size_t maxlen = 0;
+
     errno = 0;
+    struct dirent *entry;
     while ((entry = readdir(dp)) != NULL)
     {
         if (entry->d_name[0] == '.')
             continue;
-        printf("%s\n", entry->d_name);
+        if (n == cap) {
+            cap = cap ? cap * 2 : 32;
+            char **tmp = realloc(names, cap * sizeof *tmp);
+            if (tmp == NULL) {
+                perror("realloc");
+                break;
+            }
+            names = tmp;
+        }
+        names[n] = strdup(entry->d_name);
+        if (names[n] == NULL) {
+            perror("strdup");
+            break;
+        }
+        size_t len = strlen(names[n]);
+        if (len > maxlen)
+            maxlen = len;
+        n++;
     }
 
     if (errno != 0)
@@ -149,6 +185,41 @@ void do_ls(const char *dir)
     }
 
     closedir(dp);
+
+    if (n == 0) {
+        free(names);
+        return;
+    }
+
+    int term_width = 80;
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col != 0)
+        term_width = ws.ws_col;
+
+    size_t col_width = maxlen + 2;
+    size_t ncols = (size_t)term_width / col_width;
+    if (ncols == 0)
+        ncols = 1;
+    size_t nrows = (n + ncols - 1) / ncols;
+
+    for (size_t r = 0; r < nrows; r++) {
+        for (size_t c = 0; c < ncols; c++) {
+            size_t idx = c * nrows + r;
+            if (idx >= n)
+                continue;
+            size_t last_idx = (ncols - 1) * nrows + r;
+            int is_last_col = (c == ncols - 1) || (last_idx >= n);
+            if (is_last_col)
+                printf("%s", names[idx]);
+            else
+                printf("%-*s", (int)col_width, names[idx]);
+        }
+        putchar('\n');
+    }
+
+    for (size_t i = 0; i < n; i++)
+        free(names[i]);
+    free(names);
 }
 
 /*

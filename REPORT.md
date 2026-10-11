@@ -53,3 +53,38 @@ tested with bitwise AND: `mode & S_IRUSR` (owner read), `S_IWUSR`,
 `if (mode & S_ISUID) perm[3] = (mode & S_IXUSR) ? 's' : 'S';` renders the
 setuid flag in the owner's execute slot — lowercase `s` when execute is also
 set, uppercase `S` when it isn't.
+
+## v1.2.0 — Column display, down-then-across
+
+The default (non `-l`) path now prints names in columns instead of one per
+line: all names are read into a dynamic array first, the terminal width is
+queried with `ioctl()`, and entries are printed top-to-bottom, then
+left-to-right, like GNU `ls`.
+
+### Q&A
+
+**Q1. Explain the down-then-across logic — why is a single loop insufficient?**
+
+Down-then-across means columns fill vertically: the first column holds the
+first entries, the next column the following ones. The position of an item is
+therefore a 2-D function of its index: `idx = column * nrows + row`. A single
+sequential loop can't produce this layout because you can't print row 0
+without already knowing what goes in *every* column of row 0 — i.e. you need
+items 0, nrows, 2*nrows, … in hand before printing the first line. That forces
+a two-phase design: (1) read everything into memory and compute `ncols` from
+the longest name and terminal width, and (2) nested loops `for r { for c { } }`
+using the index mapping `idx = c*nrows + r`. GNU `ls` works exactly this way.
+
+**Q2. What is the purpose of `ioctl()` here? What are the limitations of a
+fixed 80-column fallback?**
+
+`ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws)` asks the kernel for the actual size of
+the terminal window backing stdout; `ws.ws_col` is its width in characters.
+We need it to compute how many columns fit (`ncols = term_width /
+(longest+2)`), so the layout adapts to wide/narrow terminals. The call fails
+when stdout is not a terminal (piped to a file or another command) and a
+fallback of 80 columns is used. Limitations: 80 is just a historical guess —
+a narrower real terminal will wrap mid-line and shatter the column alignment,
+a wider one wastes space; also, redirecting to a pipe means the "screen width"
+is meaningless, which is why GNU `ls` switches to one-per-line when stdout is
+not a tty (a refinement we haven't added yet).
