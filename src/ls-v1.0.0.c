@@ -1,7 +1,7 @@
 #define _DEFAULT_SOURCE
 
 /*
- * Programming Assignment 02: ls v1.3.0 — horizontal display (-x)
+ * Programming Assignment 02: ls v1.4.0 — alphabetical sort
  *
  * Extends v1.1.0 with the -l option:
  *   -lstat() (not stat()) so symlinks are listed as links, not followed
@@ -12,6 +12,8 @@
  * v1.3.0: -x prints names in horizontal columns (left-to-right across each
  *   row) instead; -l still selects the long listing. When both -l and -x
  *   are given, the LAST flag wins.
+ * v1.4.0: all listings are sorted alphabetically with qsort() before any
+ *   display (default, -x, and -l).
  *
  * Usage:
  *       $ ./ls
@@ -56,6 +58,29 @@ struct file_entry {
     char *name;        /* strdup'd entry name              */
     struct stat st;    /* lstat() result for the entry     */
 };
+
+/*
+ * cmp_name: qsort comparator for an array of (char *) names.
+ * qsort passes pointers to the array elements; each element is a
+ * (char *), so we cast to pointer-to-(const char *) and strcmp.
+ */
+static int cmp_name(const void *a, const void *b)
+{
+    const char * const *sa = a;
+    const char * const *sb = b;
+    return strcmp(*sa, *sb);
+}
+
+/*
+ * cmp_entry: qsort comparator for an array of struct file_entry,
+ * ordering entries by name for the sorted long listing.
+ */
+static int cmp_entry(const void *a, const void *b)
+{
+    const struct file_entry *ea = a;
+    const struct file_entry *eb = b;
+    return strcmp(ea->name, eb->name);
+}
 
 /*
  * mode_string: build the 10-char permission string from st_mode.
@@ -174,11 +199,10 @@ static void print_columns_down(char **names, size_t n, size_t maxlen)
         for (size_t c = 0; c < ncols; c++) {
             size_t idx = c * nrows + r;
             if (idx >= n)
-                continue;
-            size_t last_idx = (ncols - 1) * nrows + r;
-            int is_last_col = (c == ncols - 1) || (last_idx >= n);
-            if (is_last_col)
-                printf("%s", names[idx]);
+                break;   /* idx only grows with c: no more entries in this row */
+            size_t next_idx = (c + 1) * nrows + r;
+            if (next_idx >= n)
+                printf("%s", names[idx]);   /* last entry on this line: no padding */
             else
                 printf("%-*s", (int)col_width, names[idx]);
         }
@@ -264,6 +288,9 @@ void do_ls(const char *dir, enum display_mode mode)
         return;
     }
 
+    /* v1.4.0: sort alphabetically before any display (default and -x) */
+    qsort(names, n, sizeof *names, cmp_name);
+
     if (mode == MODE_HORIZONTAL)
         print_columns_across(names, n, maxlen);
     else
@@ -341,6 +368,9 @@ void do_ls_long(const char *dir)
     if (errno != 0)
         perror("readdir failed");
     closedir(dp);
+
+    /* v1.4.0: sort the collected entries by name so -l is sorted too */
+    qsort(arr, n, sizeof *arr, cmp_entry);
 
     printf("total %ld\n", total);
 

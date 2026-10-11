@@ -133,3 +133,48 @@ the column printer with one `if`: `MODE_HORIZONTAL` →
 logic (opendir/readdir/strdup) is shared by both layouts; only the printing
 differs, so adding a mode means adding one enum value, one flag letter, and
 one printer function.
+
+## v1.4.0 — Alphabetical sort
+
+All listings are now sorted alphabetically with `qsort()` before any display.
+In `do_ls()`, the `char **` name array is sorted with a `cmp_name`
+comparator (casts `const void *` to `const char * const *`, then `strcmp`); in
+`do_ls_long()`, the `struct file_entry` array is sorted with a `cmp_entry`
+comparator (by `name`) after reading, before the two-pass print. Memory is
+freed as before — nothing leaks. Sorting happens in every mode (default,
+`-x`, `-l`) and matches GNU `ls` byte order (uppercase before lowercase).
+During testing a v1.2.0 bug surfaced: `print_columns_down()` skipped padding
+on every column whenever the grid's last column was incomplete, so names
+printed concatenated; fixed by treating an item as last-on-line only when
+the *next* column has no entry at that row (`(c+1)*nrows + r >= n`).
+
+### Q&A
+
+**Q1. Why must all entries be read into memory before sorting? What are the
+drawbacks for millions of files?**
+
+Sorting needs random access to the whole set: an element's final position
+depends on comparisons against *all* other elements, and `readdir()` yields
+entries one at a time in arbitrary (filesystem) order. There is no way to
+emit "the first sorted entry" until every entry has been seen, so the program
+must collect everything (name + `lstat` data) into a dynamic array first and
+then sort it. Drawbacks at scale: memory grows linearly with entry count
+(millions of entries → hundreds of MB just for names and structs), and
+`qsort()`'s O(n log n) comparisons become expensive — GNU `ls` on huge
+directories has the same cost, which is why tools like `find` stream unsorted
+when order doesn't matter.
+
+**Q2. What is the purpose and signature of the `qsort` comparison function —
+why `const void *`?**
+
+`qsort()` is generic: it sorts an array of *any* element type, so it cannot
+know the element type at compile time. It hands the comparator two
+`const void *` pointers, each pointing at one array element; the comparator
+casts them to the real element type and returns negative/zero/positive
+according to their order. `void *` is C's way of saying "pointer to unknown
+type", and `const` promises the comparator won't modify the elements. For the
+name array, elements are `char *`, so the parameters are really
+`const char * const *` (pointer to a constant pointer to constant char):
+`return strcmp(*sa, *sb);`. For the long listing, elements are
+`struct file_entry`, so we cast to `const struct file_entry *` and compare
+`ea->name` vs `eb->name`.
